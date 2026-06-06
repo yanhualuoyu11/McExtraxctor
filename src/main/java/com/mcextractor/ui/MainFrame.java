@@ -29,6 +29,7 @@ public class MainFrame extends JFrame {
     private final JTextField searchField = new JTextField(25);
     private final JLabel statusLabel = new JLabel("就绪");
     private final JComboBox<String> extFilterCombo = new JComboBox<>();
+    private final JComboBox<String> versionCombo = new JComboBox<>();
 
     private File lastIndexDir;
     private File lastObjectsDir;
@@ -92,6 +93,8 @@ public class MainFrame extends JFrame {
                     AssetIndex index = assetService.loadIndex(newest);
                     treePanel.setIndex(index);
                     populateExtFilter(index);
+                    refreshVersionList(indexesDir);
+                    versionCombo.setSelectedItem(newest.getName());
                     status("已加载 " + newest.getName() + " — " + index.size() + " 个资源");
                 } catch (IOException ex) {
                     status("加载索引失败: " + newest.getName());
@@ -221,6 +224,19 @@ public class MainFrame extends JFrame {
         extFilterCombo.setMaximumSize(new Dimension(100, 28));
         extFilterCombo.addItem("全部");
         tb.add(extFilterCombo);
+
+        tb.addSeparator();
+        tb.add(new JLabel(" 版本: "));
+        versionCombo.setMaximumSize(new Dimension(130, 28));
+        versionCombo.addItem("（自动检测）");
+        versionCombo.setEnabled(false);
+        versionCombo.addActionListener(e -> {
+            if (versionCombo.getSelectedIndex() > 0) {
+                String selected = (String) versionCombo.getSelectedItem();
+                loadVersion(selected);
+            }
+        });
+        tb.add(versionCombo);
 
         tb.addSeparator();
         JButton expBtn = new JButton("导出选中");
@@ -420,6 +436,8 @@ public class MainFrame extends JFrame {
             AssetIndex index = assetService.loadIndex(file);
             treePanel.setIndex(index);
             populateExtFilter(index);
+            refreshVersionList(file.getParentFile());
+            versionCombo.setSelectedItem(file.getName());
             status("已加载 " + file.getName() + " — " + index.size() + " 个资源");
         } catch (IOException ex) {
             JOptionPane.showMessageDialog(this, "加载索引失败:\n" + ex.getMessage(),
@@ -554,6 +572,57 @@ public class MainFrame extends JFrame {
                   Ctrl+C  复制路径
                 """,
                 "关于 McExtractor", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    // ==================== 版本选择 ====================
+
+    /**
+     * 扫描 indexes 目录下的所有 JSON 文件并填充版本下拉框。
+     */
+    private void refreshVersionList(File indexesDir) {
+        versionCombo.removeAllItems();
+        versionCombo.addItem("（自动检测）");
+        if (indexesDir == null || !indexesDir.isDirectory()) {
+            versionCombo.setEnabled(false);
+            return;
+        }
+
+        File[] jsonFiles = indexesDir.listFiles(
+                (dir, name) -> name.endsWith(".json"));
+        if (jsonFiles == null || jsonFiles.length == 0) {
+            versionCombo.setEnabled(false);
+            return;
+        }
+
+        // Sort by modification time (newest first)
+        java.util.Arrays.sort(jsonFiles,
+                (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+
+        for (File f : jsonFiles) {
+            versionCombo.addItem(f.getName());
+        }
+        versionCombo.setEnabled(true);
+    }
+
+    /**
+     * 从 indexes 目录加载指定版本。
+     */
+    private void loadVersion(String fileName) {
+        if (fileName == null || lastIndexDir == null) return;
+        File indexFile = new File(lastIndexDir, fileName);
+        if (!indexFile.isFile()) return;
+
+        try {
+            AssetIndex index = assetService.loadIndex(indexFile);
+            treePanel.setIndex(index);
+            populateExtFilter(index);
+            applyFilter();
+            status("已切换至 " + fileName + " — " + index.size() + " 个资源");
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this,
+                    "加载版本失败:\n" + ex.getMessage(),
+                    "错误", JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     private void status(String msg) {

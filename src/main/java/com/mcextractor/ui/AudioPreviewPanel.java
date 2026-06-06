@@ -1,7 +1,5 @@
 package com.mcextractor.ui;
 
-import com.mcextractor.model.AssetEntry;
-
 import javax.sound.sampled.*;
 import javax.swing.*;
 import java.awt.*;
@@ -9,8 +7,14 @@ import java.io.*;
 
 /**
  * Audio player panel with playback controls.
- * Supports OGG via VorbisSPI (on classpath), WAV, and other
- * formats recognized by javax.sound.
+ * Supports OGG via VorbisSPI, WAV, and other formats recognized by javax.sound.
+ *
+ * Fixes applied:
+ * - Use AudioSystem.getAudioFileFormat(File) for reliable OGG duration detection.
+ * - Always pre-read decoded PCM into memory so totalFrames is always known;
+ *   the progress bar and time label are always accurate, and seek is precise.
+ * - Removed the fragile multi-step streamFrom that could consume the decoded
+ *   stream before the playback thread ever saw it, causing instant-stop.
  */
 public class AudioPreviewPanel extends JPanel {
     private final JLabel infoLabel;
@@ -19,15 +23,26 @@ public class AudioPreviewPanel extends JPanel {
     private final JLabel timeLabel;
     private final Timer timer;
 
-    private Clip clip;            // for short WAV-like clips
-    private SourceDataLine line;  // for streamed formats (OGG)
+    private Clip clip;
+    private SourceDataLine line;
     private Thread playbackThread;
-    private volatile boolean playing = false;
-    private volatile boolean paused = false;
+    private volatile boolean playing;
+    private volatile boolean paused;
     private File currentFile;
+
     private long totalFrames;
-    private long currentFrame;
+    private long currentFrame;      // logical stream position (base + line offset)
     private float frameRate = 44100;
+    private AudioFormat decodedFormat;
+    private boolean isStreaming;
+
+    // Pre-read buffer — every playback goes through memory so totalFrames is
+    // always known and the decoded stream is consumed exactly once.
+    private byte[] audioData;
+
+    // Guard to prevent updatePosition() → seekSlider.setValue() → ChangeListener
+    // → seek() → stopPlaybackOnly() → … infinite restart loop.
+    private volatile boolean updatingSlider;
 
     public AudioPreviewPanel() {
         super(new BorderLayout());
@@ -39,13 +54,12 @@ public class AudioPreviewPanel extends JPanel {
         add(infoPanel, BorderLayout.NORTH);
 
         JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 4));
-        playBtn = new JButton("▶");
-        pauseBtn = new JButton("❚❚");
-        stopBtn = new JButton("■");
+        playBtn = new JButton("\u25B6");
+        pauseBtn = new JButton("\u275A\u275A");
+        stopBtn = new JButton("\u25A0");
         playBtn.setToolTipText("播放");
         pauseBtn.setToolTipText("暂停");
         stopBtn.setToolTipText("停止");
-
         controlPanel.add(playBtn);
         controlPanel.add(pauseBtn);
         controlPanel.add(stopBtn);
@@ -56,22 +70,27 @@ public class AudioPreviewPanel extends JPanel {
 
         timeLabel = new JLabel("00:00 / 00:00");
         controlPanel.add(timeLabel);
-
         add(controlPanel, BorderLayout.CENTER);
 
         playBtn.addActionListener(e -> play());
         pauseBtn.addActionListener(e -> pauseResume());
         stopBtn.addActionListener(e -> stop());
+
         seekSlider.addChangeListener(e -> {
-            if (seekSlider.getValueIsAdjusting() && (clip != null || line != null)) {
-                double frac = seekSlider.getValue() / 1000.0;
-                seek((long)(frac * totalFrames));
+            if (updatingSlider) return; // programmatic update — don't seek
+            if (!seekSlider.isEnabled() || totalFrames <= 0) return;
+            boolean adjusting = seekSlider.getValueIsAdjusting();
+            if (clip != null && adjusting) {
+                seekClip((long) (seekSlider.getValue() / 1000.0 * totalFrames));
+            } else if (!adjusting) {
+                seek((long) (seekSlider.getValue() / 1000.0 * totalFrames));
             }
         });
 
-        // update seek bar periodically
         timer = new Timer(250, e -> updatePosition());
     }
+
+    // ---- public API ----
 
     public void load(File file) {
         stop();
@@ -79,24 +98,32 @@ public class AudioPreviewPanel extends JPanel {
         infoLabel.setText(file.getName());
     }
 
+    public void clear() {
+        stop();
+        currentFile = null;
+        infoLabel.setText("选择音频文件以预览");
+        timeLabel.setText("00:00 / 00:00");
+    }
+
+    // ---- playback controls ----
+
     private void play() {
         if (currentFile == null || !currentFile.isFile()) return;
         stop();
 
-        // First, try loading as a Clip (works well for short WAV/PCM files)
+        // Try Clip first (short WAV / PCM files)
         try (AudioInputStream probe = AudioSystem.getAudioInputStream(currentFile)) {
             AudioFormat fmt = probe.getFormat();
-            totalFrames = probe.getFrameLength();
-            frameRate = fmt.getFrameRate() > 0 ? fmt.getFrameRate() : 44100;
-
-            if (totalFrames > 0 && totalFrames < 48000 * 300) { // up to ~5 min
+            long frames = probe.getFrameLength();
+            if (frames > 0 && frames < 48000 * 300) {
                 try {
-                    DataLine.Info info = new DataLine.Info(Clip.class, fmt);
-                    clip = (Clip) AudioSystem.getLine(info);
+                    clip = (Clip) AudioSystem.getLine(new DataLine.Info(Clip.class, fmt));
                     clip.open(probe);
+                    totalFrames = frames;
+                    frameRate = fmt.getFrameRate() > 0 ? fmt.getFrameRate() : 44100;
                     clip.start();
                     playing = true;
-                    paused = false;
+                    isStreaming = false;
                     seekSlider.setEnabled(true);
                     timer.start();
                     updateInfo("正在播放: " + currentFile.getName());
@@ -111,54 +138,210 @@ public class AudioPreviewPanel extends JPanel {
                     });
                     return;
                 } catch (Exception ignored) {
-                    // Clip opening failed; close probe and fall through
                     while (probe.read() != -1) { /* drain */ }
                 }
             }
         } catch (Exception ignored) {
-            // probe failed, fall through to streaming
+            // fall through to streaming
         }
 
-        // Fallback: stream via SourceDataLine (handles OGG, long files, etc.)
-        try {
-            AudioInputStream ais = AudioSystem.getAudioInputStream(currentFile);
-            AudioFormat srcFmt = ais.getFormat();
-            float sr = srcFmt.getSampleRate() > 0 ? srcFmt.getSampleRate() : 44100;
-            AudioFormat decodedFmt = new AudioFormat(
-                    AudioFormat.Encoding.PCM_SIGNED,
-                    sr, 16,
-                    srcFmt.getChannels() > 0 ? srcFmt.getChannels() : 2,
-                    (srcFmt.getChannels() > 0 ? srcFmt.getChannels() : 2) * 2,
-                    sr, false);
+        // Stream: decode, pre-read into memory, then play.
+        streamFromFile(currentFile, 0);
+    }
 
-            // convert if needed
-            if (!AudioSystem.isConversionSupported(decodedFmt, srcFmt)) {
-                decodedFmt = srcFmt; // use as-is
+    private void pauseResume() {
+        if (!playing) { play(); return; }
+        paused = !paused;
+        if (clip != null) {
+            if (paused) {
+                currentFrame = clip.getFramePosition();
+                clip.stop();
+            } else {
+                clip.setFramePosition((int) currentFrame);
+                clip.start();
             }
-            AudioInputStream decoded = AudioSystem.getAudioInputStream(decodedFmt, ais);
+        }
+        updateInfo(paused ? "已暂停" : "正在播放: "
+                + (currentFile != null ? currentFile.getName() : ""));
+    }
 
-            DataLine.Info info = new DataLine.Info(SourceDataLine.class, decodedFmt);
-            line = (SourceDataLine) AudioSystem.getLine(info);
-            line.open(decodedFmt);
+    private void stop() {
+        playing = false;
+        paused = false;
+        isStreaming = false;
+        currentFrame = 0;
+        timer.stop();
+        if (playbackThread != null) {
+            playbackThread.interrupt();
+            playbackThread = null;
+        }
+        if (clip != null) { clip.stop(); clip.close(); clip = null; }
+        if (line != null) { line.stop(); line.close(); line = null; }
+        audioData = null;
+        updatingSlider = true;
+        seekSlider.setValue(0);
+        updatingSlider = false;
+        seekSlider.setEnabled(false);
+        updateInfo("已停止");
+    }
+
+    private void stopPlaybackOnly() {
+        playing = false;
+        paused = false;
+        if (playbackThread != null) { playbackThread.interrupt(); playbackThread = null; }
+        if (clip != null) { clip.stop(); clip.close(); clip = null; }
+        if (line != null) { line.stop(); line.close(); line = null; }
+        // keep audioData and totalFrames for seek restart
+    }
+
+    // ---- seeking ----
+
+    private void seekClip(long frame) {
+        if (clip == null || frame < 0 || totalFrames <= 0) return;
+        clip.setFramePosition((int) Math.min(frame, totalFrames - 1));
+        if (playing && !clip.isRunning()) clip.start();
+    }
+
+    private void seek(long frame) {
+        if (frame < 0 || totalFrames <= 0) return;
+        long target = Math.min(frame, totalFrames - 1);
+        if (clip != null) { seekClip(target); return; }
+        if (audioData == null) return;
+        stopPlaybackOnly();
+        playFromMemory(target);
+    }
+
+    // ---- core: decode file → memory → play ----
+
+    /**
+     * Decode the given file into PCM, pre-read everything into {@link #audioData},
+     * then start playback from {@code startFrame}.
+     *
+     * <p>totalFrames is determined via (in order):
+     * <ol>
+     *   <li>{@code AudioSystem.getAudioFileFormat(File)} duration property, or</li>
+     *   <li>{@code audioData.length / frameSize} as a precise fallback.</li>
+     * </ol>
+     */
+    private void streamFromFile(File file, long startFrame) {
+        try {
+            // --- determine duration (fast, metadata-only) ---
+            totalFrames = Long.MAX_VALUE;
+            try {
+                AudioFileFormat aff = AudioSystem.getAudioFileFormat(file);
+                Object dur = aff.properties().get("duration");
+                if (dur instanceof Number) {
+                    long us = ((Number) dur).longValue();
+                    float sr = aff.getFormat().getSampleRate();
+                    if (sr > 0 && us > 0) {
+                        totalFrames = (long) (us * sr / 1_000_000.0);
+                    }
+                }
+            } catch (Exception ignored) { /* keep Long.MAX_VALUE */ }
+
+            // --- decode to PCM ---
+            AudioInputStream raw = AudioSystem.getAudioInputStream(file);
+            AudioFormat srcFmt = raw.getFormat();
+            float sr = srcFmt.getSampleRate() > 0 ? srcFmt.getSampleRate() : 44100;
+            int ch = srcFmt.getChannels() > 0 ? srcFmt.getChannels() : 2;
+            AudioFormat pcmFmt = new AudioFormat(
+                    AudioFormat.Encoding.PCM_SIGNED, sr, 16, ch, ch * 2, sr, false);
+            if (!AudioSystem.isConversionSupported(pcmFmt, srcFmt)) {
+                pcmFmt = srcFmt;
+            }
+            decodedFormat = pcmFmt;
+            AudioInputStream decoded = AudioSystem.getAudioInputStream(pcmFmt, raw);
+
+            // --- pre-read ALL decoded PCM into memory ---
+            audioData = readAllBytes(decoded);
+            decoded.close();
+
+            int frameSize = pcmFmt.getFrameSize();
+            if (frameSize <= 0 || audioData.length == 0) {
+                updateInfo("错误: 解码后无数据");
+                return;
+            }
+
+            // --- compute exact totalFrames if still unknown ---
+            if (totalFrames == Long.MAX_VALUE) {
+                totalFrames = audioData.length / frameSize;
+            }
+
+            frameRate = pcmFmt.getFrameRate();
+
+            // --- start playback from the requested offset ---
+            playFromMemory(startFrame);
+
+        } catch (Exception ex) {
+            updateInfo("错误: " + ex.getMessage());
+            ex.printStackTrace();
+        }
+    }
+
+    /**
+     * Play the pre-read {@link #audioData} starting at {@code startFrame}.
+     */
+    private void playFromMemory(long startFrame) {
+        try {
+            if (audioData == null || audioData.length == 0) {
+                updateInfo("无音频数据");
+                return;
+            }
+            int frameSize = decodedFormat.getFrameSize();
+            if (frameSize <= 0) {
+                updateInfo("无法确定帧大小");
+                return;
+            }
+
+            long byteOffset = startFrame * frameSize;
+            if (byteOffset >= audioData.length) {
+                updateInfo("跳转位置超出音频长度");
+                return;
+            }
+
+            int remaining = audioData.length - (int) byteOffset;
+            ByteArrayInputStream bais = new ByteArrayInputStream(audioData, (int) byteOffset, remaining);
+            AudioInputStream memStream = new AudioInputStream(bais, decodedFormat,
+                    remaining / frameSize);
+
+            currentFrame = startFrame;
+            startStreamingPlayback(memStream, decodedFormat,
+                    currentFile != null ? currentFile.getName() : "");
+
+        } catch (Exception ex) {
+            updateInfo("错误: " + ex.getMessage());
+            ex.printStackTrace();
+        }
+    }
+
+    /**
+     * Open a SourceDataLine, start it, and launch the background read-write thread.
+     */
+    private void startStreamingPlayback(AudioInputStream stream, AudioFormat fmt, String fileName) {
+        try {
+            line = (SourceDataLine) AudioSystem.getLine(
+                    new DataLine.Info(SourceDataLine.class, fmt));
+            line.open(fmt);
             line.start();
+
             playing = true;
             paused = false;
-            frameRate = decodedFmt.getFrameRate();
-            totalFrames = Long.MAX_VALUE; // unknown length
+            isStreaming = true;
             seekSlider.setEnabled(true);
             timer.start();
-            updateInfo("正在播放（流式）: " + currentFile.getName());
+            updateInfo("正在播放（流式）: " + fileName);
 
-            // read & write in background
-            AudioInputStream finalAis = decoded;
+            AudioInputStream finalStream = stream;
             SourceDataLine finalLine = line;
+
             playbackThread = new Thread(() -> {
                 try {
                     byte[] buf = new byte[4096];
                     int n;
-                    while (playing && (n = finalAis.read(buf)) != -1) {
+                    while (playing && (n = finalStream.read(buf)) != -1) {
                         while (paused && playing) {
-                            try { Thread.sleep(100); } catch (InterruptedException ie) { break; }
+                            try { Thread.sleep(100); }
+                            catch (InterruptedException ie) { break; }
                         }
                         if (!playing) break;
                         finalLine.write(buf, 0, n);
@@ -167,8 +350,14 @@ public class AudioPreviewPanel extends JPanel {
                 } catch (IOException e) {
                     e.printStackTrace();
                 } finally {
+                    // Capture the line this thread was using.  If the field has
+                    // been replaced (seek / restart), this finally is stale and
+                    // must not kill the new playback.
+                    SourceDataLine myLine = finalLine;
                     SwingUtilities.invokeLater(() -> {
+                        if (line != myLine) return; // newer playback running
                         playing = false;
+                        isStreaming = false;
                         timer.stop();
                         if (line != null && line.isOpen()) line.close();
                         updateInfo("播放结束");
@@ -184,52 +373,46 @@ public class AudioPreviewPanel extends JPanel {
         }
     }
 
-    private void pauseResume() {
-        if (!playing) { play(); return; }
-        paused = !paused;
-        if (clip != null) {
-            if (paused) {
-                currentFrame = clip.getFramePosition();
-                clip.stop();
-            } else {
-                clip.setFramePosition((int)currentFrame);
-                clip.start();
-            }
-        }
-        updateInfo(paused ? "已暂停" : "正在播放: " + currentFile.getName());
-    }
-
-    private void stop() {
-        playing = false;
-        paused = false;
-        timer.stop();
-        if (playbackThread != null) { playbackThread.interrupt(); playbackThread = null; }
-        if (clip != null) { clip.stop(); clip.close(); clip = null; }
-        if (line != null) { line.stop(); line.close(); line = null; }
-        seekSlider.setValue(0);
-        seekSlider.setEnabled(false);
-        updateInfo("已停止");
-    }
-
-    private void seek(long frame) {
-        if (clip != null) {
-            clip.setFramePosition((int)frame);
-            clip.start();
-        }
-    }
+    // ---- position / time display ----
 
     private void updatePosition() {
+        boolean userDragging = seekSlider.getValueIsAdjusting();
+
         if (clip != null && clip.isOpen()) {
             long pos = clip.getFramePosition();
-            long len = clip.getFrameLength();
-            if (len > 0) {
-                seekSlider.setValue((int)(pos * 1000 / len));
-                timeLabel.setText(formatTime(pos) + " / " + formatTime(len));
+            if (totalFrames > 0) {
+                if (!userDragging) {
+                    updatingSlider = true;
+                    seekSlider.setValue(Math.min((int) (pos * 1000 / totalFrames), 1000));
+                    updatingSlider = false;
+                }
+                timeLabel.setText(formatTime(pos) + " / " + formatTime(totalFrames));
             }
-        } else if (line != null && line.isOpen()) {
-            long pos = line.getFramePosition();
-            timeLabel.setText(formatTime(pos));
+        } else if (line != null && line.isOpen() && isStreaming) {
+            long pos = line.getFramePosition() + currentFrame;
+            if (totalFrames > 0) {
+                if (!userDragging) {
+                    updatingSlider = true;
+                    seekSlider.setValue(Math.min((int) (pos * 1000 / totalFrames), 1000));
+                    updatingSlider = false;
+                }
+                timeLabel.setText(formatTime(pos) + " / " + formatTime(totalFrames));
+            } else {
+                timeLabel.setText(formatTime(pos) + " / --:--");
+            }
         }
+    }
+
+    // ---- helpers ----
+
+    private static byte[] readAllBytes(InputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        byte[] tmp = new byte[8192];
+        int n;
+        while ((n = in.read(tmp)) != -1) {
+            buf.write(tmp, 0, n);
+        }
+        return buf.toByteArray();
     }
 
     private void updateInfo(String text) {
@@ -238,16 +421,7 @@ public class AudioPreviewPanel extends JPanel {
 
     private String formatTime(long frames) {
         if (frameRate <= 0) frameRate = 44100;
-        long secs = (long)(frames / frameRate);
-        long min = secs / 60;
-        long sec = secs % 60;
-        return String.format("%02d:%02d", min, sec);
-    }
-
-    public void clear() {
-        stop();
-        currentFile = null;
-        infoLabel.setText("选择音频文件以预览");
-        timeLabel.setText("00:00 / 00:00");
+        long secs = (long) (frames / frameRate);
+        return String.format("%02d:%02d", secs / 60, secs % 60);
     }
 }
