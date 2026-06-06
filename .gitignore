@@ -1,0 +1,22 @@
+# Build output
+target/
+*.jar
+!target/*-with-dependencies.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Minecraft assets (user data)
+.minecraft/
+
