@@ -1,6 +1,7 @@
 name: Build Java & Release JAR
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'           # 打 v1.0 / v2.0 标签时自动运行
