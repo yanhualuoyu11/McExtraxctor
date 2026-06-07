@@ -13,6 +13,7 @@ import java.io.File;
 import java.io.FilenameFilter;
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 主窗口 — 组合树形导航、资源表格和预览面板。
@@ -494,17 +495,20 @@ public class MainFrame extends JFrame {
         }
         File dir = chooseExportDir();
         if (dir == null) return;
-        int ok = exportService.exportBatch(sel, dir, true, this);
-        status("已导出 " + ok + " / " + sel.size() + " 个文件到 " + dir.getName());
+        exportWithProgress(sel, dir, true);
     }
 
     private void exportAll() {
         File dir = chooseExportDir();
         if (dir == null) return;
-        int total = assetService.getCurrentIndex() != null
-                ? assetService.getCurrentIndex().size() : 0;
-        int ok = exportService.exportAll(dir, true, this);
-        status("已导出 " + ok + " / " + total + " 个文件到 " + dir.getName());
+        List<AssetEntry> all = assetService.getCurrentIndex() != null
+                ? assetService.getCurrentIndex().getAllEntries() : List.of();
+        if (all.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "没有可导出的资源。",
+                    "导出", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        exportWithProgress(all, dir, true);
     }
 
     private void exportVisible() {
@@ -516,8 +520,7 @@ public class MainFrame extends JFrame {
         }
         File dir = chooseExportDir();
         if (dir == null) return;
-        int ok = exportService.exportBatch(visible, dir, true, this);
-        status("已导出 " + ok + " / " + visible.size() + " 个文件到 " + dir.getName());
+        exportWithProgress(visible, dir, true);
     }
 
     private void exportByType(String ext) {
@@ -525,8 +528,109 @@ public class MainFrame extends JFrame {
         if (dir == null) return;
         List<AssetEntry> filtered = assetService.getCurrentIndex() != null
                 ? assetService.getCurrentIndex().getByExtension(ext) : List.of();
-        int ok = exportService.exportBatch(filtered, dir, true, this);
-        status("已导出 " + ok + " 个 ." + ext + " 文件到 " + dir.getName());
+        if (filtered.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "没有 ." + ext + " 类型的资源。",
+                    "导出", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        exportWithProgress(filtered, dir, true);
+    }
+
+    private void exportWithProgress(List<AssetEntry> entries, File targetDir,
+                                     boolean preserveStructure) {
+        final int total = entries.size();
+
+        // 进度条对话框
+        JDialog dialog = new JDialog(this, "正在导出...", true);
+        dialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        dialog.setSize(480, 150);
+        dialog.setLocationRelativeTo(this);
+        dialog.setLayout(new BorderLayout(10, 10));
+
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+        JProgressBar progressBar = new JProgressBar(0, total);
+        progressBar.setStringPainted(true);
+
+        JLabel fileLabel = new JLabel("准备导出 " + total + " 个文件...");
+        fileLabel.setFont(fileLabel.getFont().deriveFont(Font.PLAIN, 12f));
+
+        JButton cancelButton = new JButton("取消");
+
+        JPanel bottomPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        bottomPanel.add(cancelButton);
+
+        panel.add(progressBar, BorderLayout.NORTH);
+        panel.add(fileLabel, BorderLayout.CENTER);
+        panel.add(bottomPanel, BorderLayout.SOUTH);
+
+        dialog.add(panel);
+
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            cancelButton.setEnabled(false);
+            cancelButton.setText("正在取消...");
+        });
+
+        SwingWorker<Integer, String> worker = new SwingWorker<>() {
+            @Override
+            protected Integer doInBackground() {
+                SwingUtilities.invokeLater(() -> cancelButton.setEnabled(true));
+
+                ExportService.ExportProgressCallback callback =
+                        new ExportService.ExportProgressCallback() {
+                    @Override
+                    public void onProgress(int current, int total, String currentFile) {
+                        publish(currentFile);
+                        setProgress(100 * current / total);
+                    }
+
+                    @Override
+                    public boolean isCancelled() {
+                        return cancelled.get();
+                    }
+                };
+
+                return exportService.exportBatch(entries, targetDir,
+                        preserveStructure, MainFrame.this, callback);
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                if (!chunks.isEmpty()) {
+                    fileLabel.setText(chunks.get(chunks.size() - 1));
+                }
+            }
+
+            @Override
+            protected void done() {
+                dialog.dispose();
+                try {
+                    int ok = get();
+                    if (cancelled.get()) {
+                        status("导出已取消 — " + ok + " 个文件已导出到 "
+                                + targetDir.getName());
+                    } else {
+                        status("已导出 " + ok + " / " + total + " 个文件到 "
+                                + targetDir.getName());
+                    }
+                } catch (Exception ex) {
+                    status("导出失败: " + ex.getMessage());
+                }
+            }
+        };
+
+        worker.addPropertyChangeListener(evt -> {
+            if ("progress".equals(evt.getPropertyName())) {
+                progressBar.setValue(worker.getProgress());
+            }
+        });
+
+        worker.execute();
+        dialog.setVisible(true);
     }
 
     private File chooseExportDir() {

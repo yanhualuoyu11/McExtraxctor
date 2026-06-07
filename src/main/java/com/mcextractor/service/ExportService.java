@@ -18,6 +18,22 @@ public class ExportService {
         this.assetService = assetService;
     }
 
+    // ---- callback interface ----
+
+    /**
+     * Callback for batch export progress reporting and cancellation.
+     * All methods are called from the worker thread, not the EDT.
+     */
+    public interface ExportProgressCallback {
+        /** Report progress: current index (1-based), total count, current file path. */
+        void onProgress(int current, int total, String currentFile);
+
+        /** Return true if the export should be cancelled. */
+        boolean isCancelled();
+    }
+
+    // ---- single export (no progress needed) ----
+
     /**
      * Export a single entry.  Shows a file-save dialog to pick destination.
      */
@@ -38,27 +54,57 @@ public class ExportService {
         return copy(src, dest, parent);
     }
 
+    // ---- batch export with progress ----
+
     /**
      * Export a list of entries to a target directory, preserving
      * the relative path structure (e.g. minecraft/textures/...).
+     *
+     * @param callback  optional progress callback; may be null.
+     * @return number of successfully exported files
      */
     public int exportBatch(List<AssetEntry> entries, File targetDir,
-                           boolean preserveStructure, JFrame parent) {
+                           boolean preserveStructure, JFrame parent,
+                           ExportProgressCallback callback) {
         if (entries.isEmpty()) {
             showInfo(parent, "未选中任何资源。");
             return 0;
         }
         int ok = 0, fail = 0;
-        for (AssetEntry e : entries) {
+        int total = entries.size();
+        for (int i = 0; i < total; i++) {
+            // check cancellation
+            if (callback != null && callback.isCancelled()) {
+                break;
+            }
+
+            AssetEntry e = entries.get(i);
             File src = assetService.resolveFile(e);
-            if (src == null || !src.isFile()) { fail++; continue; }
+            if (src == null || !src.isFile()) {
+                fail++;
+                // still report progress even on failure
+                if (callback != null) {
+                    callback.onProgress(i + 1, total, e.getPath());
+                }
+                continue;
+            }
+
             File dest;
             if (preserveStructure) {
                 dest = new File(targetDir, e.getPath());
             } else {
                 dest = new File(targetDir, new File(e.getPath()).getName());
             }
-            if (copy(src, dest, parent)) ok++; else fail++;
+
+            if (copy(src, dest, parent)) {
+                ok++;
+            } else {
+                fail++;
+            }
+
+            if (callback != null) {
+                callback.onProgress(i + 1, total, e.getPath());
+            }
         }
         return ok;
     }
@@ -66,20 +112,22 @@ public class ExportService {
     /**
      * Export everything to a directory.
      */
-    public int exportAll(File targetDir, boolean preserveStructure, JFrame parent) {
+    public int exportAll(File targetDir, boolean preserveStructure,
+                         JFrame parent, ExportProgressCallback callback) {
         if (assetService.getCurrentIndex() == null) return 0;
         return exportBatch(assetService.getCurrentIndex().getAllEntries(),
-                targetDir, preserveStructure, parent);
+                targetDir, preserveStructure, parent, callback);
     }
 
     /**
      * Export entries of a given extension type.
      */
     public int exportByExtension(String ext, File targetDir,
-                                 boolean preserveStructure, JFrame parent) {
+                                 boolean preserveStructure, JFrame parent,
+                                 ExportProgressCallback callback) {
         if (assetService.getCurrentIndex() == null) return 0;
         List<AssetEntry> filtered = assetService.getCurrentIndex().getByExtension(ext);
-        return exportBatch(filtered, targetDir, preserveStructure, parent);
+        return exportBatch(filtered, targetDir, preserveStructure, parent, callback);
     }
 
     // ---- internal ----
